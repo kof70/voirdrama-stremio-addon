@@ -1,6 +1,5 @@
 import sdk from "stremio-addon-sdk";
 import http from "http";
-import https from "https";
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -636,20 +635,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
   return handleStream(id);
 });
 
-const certPath = process.env.CERT_PATH || "certs/cert.pem";
-const keyPath = process.env.KEY_PATH || "certs/key.pem";
-let httpsEnabled = false;
-let cert = null;
-let key = null;
-
-try {
-  cert = await fs.readFile(certPath);
-  key = await fs.readFile(keyPath);
-  httpsEnabled = true;
-} catch {
-  httpsEnabled = false;
-}
-
 const addonInterface = builder.getInterface();
 const app = express();
 const hasConfig = !!(addonInterface.manifest.config || []).length;
@@ -678,14 +663,5 @@ if (hasConfig) {
   });
 }
 
-if (httpsEnabled) {
-  https.createServer({ key, cert }, app).listen(PORT, "0.0.0.0");
-} else {
-  http.createServer(app).listen(PORT, "0.0.0.0");
-}
-
-console.log(
-  httpsEnabled
-    ? `VoirDrama addon running at https://0.0.0.0:${PORT}/manifest.json`
-    : `VoirDrama addon running at http://0.0.0.0:${PORT}/manifest.json`
-);
+http.createServer(app).listen(PORT, "0.0.0.0");
+console.log(`VoirDrama addon running at http://0.0.0.0:${PORT}/manifest.json`);

@@ -1,22 +1,30 @@
 import sdk from "stremio-addon-sdk";
+import http from "http";
 import https from "https";
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
+import { createRequire } from "module";
 
 const BASE_URL = "https://voirdrama.org";
 const PORT = Number(process.env.PORT || 7000);
 const CACHE_DIR = process.env.CACHE_DIR || "/tmp/voirdrama-stremio-cache";
-const { addonBuilder, serveHTTP } = sdk;
+const { addonBuilder } = sdk;
+const require = createRequire(import.meta.url);
+const express = require("express");
+const getRouter = require("stremio-addon-sdk/src/getRouter");
+const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
 
 const manifest = {
-  id: "org.voirdrama.personal",
-  version: "0.1.0",
-  name: "VoirDrama (Perso)",
-  description: "Addon perso pour VoirDrama (catalogue, metadata, stream)",
+  id: "org.voirdrama.addon",
+  version: "0.1.1",
+  name: "VoirDrama",
+  description: "Addon VoirDrama (catalogue, metadata, stream)",
+  logo: "https://voirdrama.org/wp-content/uploads/2022/07/voirdrama-logo.png",
+  background: "https://voirdrama.org/wp-content/uploads/2022/07/voirdrama-logo.png",
   resources: ["catalog", "meta", "stream"],
   types: ["series"],
-  idPrefixes: ["tt"],
+  idPrefixes: ["voirdrama"],
   catalogs: [
     {
       type: "series",
@@ -40,6 +48,11 @@ const manifest = {
 };
 
 const cache = new Map();
+const CACHE_VERSION = "v2";
+const stats = {
+  startedAt: new Date().toISOString(),
+  requests: { catalog: 0, meta: 0, stream: 0 }
+};
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const PAGE_SIZE = 10;
 
@@ -81,7 +94,7 @@ async function diskCacheSet(key, value, ttlMs = CACHE_TTL_MS) {
 }
 
 function cacheKeyToFile(key) {
-  return crypto.createHash("sha1").update(key).digest("hex") + ".json";
+  return crypto.createHash("sha1").update(`${CACHE_VERSION}:${key}`).digest("hex") + ".json";
 }
 
 async function fetchHtml(url) {
@@ -538,10 +551,7 @@ async function handleMeta(seriesId) {
   if (cinemeta) {
     if (cinemeta.poster) meta.poster = cinemeta.poster;
     if (cinemeta.background) meta.background = cinemeta.background;
-    if (cinemeta.imdb_id) {
-      meta.imdb_id = cinemeta.imdb_id;
-      meta.id = cinemeta.imdb_id;
-    }
+    if (cinemeta.imdb_id) meta.imdb_id = cinemeta.imdb_id;
   }
 
   return { meta };
@@ -581,32 +591,47 @@ async function handleStream(videoId) {
 const builder = new addonBuilder(manifest);
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
+  console.log(`[catalog] type=${type} id=${id} extra=${JSON.stringify(extra || {})}`);
+  stats.requests.catalog += 1;
   if (type !== "series") return { metas: [] };
 
   if (id === "voirdrama-ongoing") {
     const skip = Number(extra && extra.skip ? extra.skip : 0);
-    return handleCatalogOngoing(Number.isNaN(skip) ? 0 : skip);
+    const result = await handleCatalogOngoing(Number.isNaN(skip) ? 0 : skip);
+    const first = result.metas && result.metas[0] ? result.metas[0].id : "none";
+    console.log(`[catalog] first-id=${first}`);
+    return result;
   }
 
   if (id === "voirdrama-recent") {
     const skip = Number(extra && extra.skip ? extra.skip : 0);
-    return handleCatalogPaged(null, Number.isNaN(skip) ? 0 : skip, "recent");
+    const result = await handleCatalogPaged(null, Number.isNaN(skip) ? 0 : skip, "recent");
+    const first = result.metas && result.metas[0] ? result.metas[0].id : "none";
+    console.log(`[catalog] first-id=${first}`);
+    return result;
   }
 
   if (id === "voirdrama-search") {
     const search = (extra && extra.search) || null;
-    return handleCatalog(search || "");
+    const result = await handleCatalog(search || "");
+    const first = result.metas && result.metas[0] ? result.metas[0].id : "none";
+    console.log(`[catalog] first-id=${first}`);
+    return result;
   }
 
   return { metas: [] };
 });
 
 builder.defineMetaHandler(async ({ type, id }) => {
+  console.log(`[meta] type=${type} id=${id}`);
+  stats.requests.meta += 1;
   if (type !== "series") return { meta: null };
   return handleMeta(id);
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
+  console.log(`[stream] type=${type} id=${id}`);
+  stats.requests.stream += 1;
   if (type !== "series") return { streams: [] };
   return handleStream(id);
 });
@@ -614,15 +639,49 @@ builder.defineStreamHandler(async ({ type, id }) => {
 const certPath = process.env.CERT_PATH || "certs/cert.pem";
 const keyPath = process.env.KEY_PATH || "certs/key.pem";
 let httpsEnabled = false;
+let cert = null;
+let key = null;
 
 try {
-  const cert = await fs.readFile(certPath);
-  const key = await fs.readFile(keyPath);
-  const server = https.createServer({ key, cert }, serveHTTP(builder.getInterface()));
-  server.listen(PORT, "0.0.0.0");
+  cert = await fs.readFile(certPath);
+  key = await fs.readFile(keyPath);
   httpsEnabled = true;
 } catch {
-  serveHTTP(builder.getInterface(), { host: "0.0.0.0", port: PORT });
+  httpsEnabled = false;
+}
+
+const addonInterface = builder.getInterface();
+const app = express();
+const hasConfig = !!(addonInterface.manifest.config || []).length;
+const landingHTML = landingTemplate(addonInterface.manifest);
+
+app.get("/stats.json", (_, res) => {
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify(stats));
+});
+
+app.use(getRouter(addonInterface));
+
+app.get("/", (_, res) => {
+  if (hasConfig) {
+    res.redirect("/configure");
+  } else {
+    res.setHeader("content-type", "text/html");
+    res.end(landingHTML);
+  }
+});
+
+if (hasConfig) {
+  app.get("/configure", (_, res) => {
+    res.setHeader("content-type", "text/html");
+    res.end(landingHTML);
+  });
+}
+
+if (httpsEnabled) {
+  https.createServer({ key, cert }, app).listen(PORT, "0.0.0.0");
+} else {
+  http.createServer(app).listen(PORT, "0.0.0.0");
 }
 
 console.log(

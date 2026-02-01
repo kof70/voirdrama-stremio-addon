@@ -386,14 +386,7 @@ async function enrichMetasWithCinemeta(items) {
     if (!cinemeta) continue;
     if (cinemeta.poster) item.poster = cinemeta.poster;
     if (cinemeta.background) item.background = cinemeta.background;
-    if (cinemeta.imdb_id) {
-      item.imdb_id = cinemeta.imdb_id;
-      if (item.id && item.id.startsWith("voirdrama:")) {
-        const slug = item._slug || item.id.split(":")[1];
-        imdbToSlug.set(cinemeta.imdb_id, slug);
-        item.id = cinemeta.imdb_id;
-      }
-    }
+    if (cinemeta.imdb_id) item.imdb_id = cinemeta.imdb_id;
   }
 }
 

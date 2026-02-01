@@ -50,7 +50,8 @@ const cache = new Map();
 const CACHE_VERSION = "v2";
 const stats = {
   startedAt: new Date().toISOString(),
-  requests: { catalog: 0, meta: 0, stream: 0 }
+  requests: { catalog: 0, meta: 0, stream: 0 },
+  lastError: null
 };
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const PAGE_SIZE = 10;
@@ -443,27 +444,45 @@ async function resolveVidmoly(embedUrl) {
 }
 
 async function handleCatalog(search) {
-  const url = search
-    ? `${BASE_URL}/?s=${encodeURIComponent(search)}&post_type=wp-manga`
-    : `${BASE_URL}/drama/`;
+  try {
+    const url = search
+      ? `${BASE_URL}/?s=${encodeURIComponent(search)}&post_type=wp-manga`
+      : `${BASE_URL}/drama/`;
 
-  const html = await fetchHtml(url);
-  const items = parseCatalogItems(html);
-  await enrichMetasWithCinemeta(items);
-  for (const item of items) delete item._slug;
-  return { metas: items };
+    const html = await fetchHtml(url);
+    const items = parseCatalogItems(html);
+    await enrichMetasWithCinemeta(items);
+    for (const item of items) delete item._slug;
+    return { metas: items };
+  } catch (err) {
+    stats.lastError = {
+      at: new Date().toISOString(),
+      where: "catalog",
+      message: err?.message || String(err)
+    };
+    return { metas: [] };
+  }
 }
 
 async function handleCatalogPaged(search, skip, mode = "default") {
-  if (search) return handleCatalog(search);
-  const page = Math.floor((skip || 0) / PAGE_SIZE) + 1;
-  const basePath = page > 1 ? `${BASE_URL}/drama/page/${page}/` : `${BASE_URL}/drama/`;
-  const url = mode === "recent" ? `${basePath}?m_orderby=new-manga` : basePath;
-  const html = await fetchHtml(url);
-  const items = parseCatalogItems(html);
-  await enrichMetasWithCinemeta(items);
-  for (const item of items) delete item._slug;
-  return { metas: items };
+  try {
+    if (search) return handleCatalog(search);
+    const page = Math.floor((skip || 0) / PAGE_SIZE) + 1;
+    const basePath = page > 1 ? `${BASE_URL}/drama/page/${page}/` : `${BASE_URL}/drama/`;
+    const url = mode === "recent" ? `${basePath}?m_orderby=new-manga` : basePath;
+    const html = await fetchHtml(url);
+    const items = parseCatalogItems(html);
+    await enrichMetasWithCinemeta(items);
+    for (const item of items) delete item._slug;
+    return { metas: items };
+  } catch (err) {
+    stats.lastError = {
+      at: new Date().toISOString(),
+      where: "catalogPaged",
+      message: err?.message || String(err)
+    };
+    return { metas: [] };
+  }
 }
 
 async function isOngoing(slug) {
@@ -483,36 +502,45 @@ async function isOngoing(slug) {
 }
 
 async function handleCatalogOngoing(skip) {
-  const metas = [];
-  let remainingSkip = Math.max(0, skip || 0);
-  let page = 1;
-  const maxPages = 12;
+  try {
+    const metas = [];
+    let remainingSkip = Math.max(0, skip || 0);
+    let page = 1;
+    const maxPages = 12;
 
-  while (metas.length < PAGE_SIZE && page <= maxPages) {
-    const basePath = page > 1 ? `${BASE_URL}/drama/page/${page}/` : `${BASE_URL}/drama/`;
-    const html = await fetchHtml(basePath);
-    const items = parseCatalogItems(html);
+    while (metas.length < PAGE_SIZE && page <= maxPages) {
+      const basePath = page > 1 ? `${BASE_URL}/drama/page/${page}/` : `${BASE_URL}/drama/`;
+      const html = await fetchHtml(basePath);
+      const items = parseCatalogItems(html);
 
-    for (const item of items) {
-      const slug = item._slug;
-      if (!slug) continue;
-      if (!(await isOngoing(slug))) continue;
+      for (const item of items) {
+        const slug = item._slug;
+        if (!slug) continue;
+        if (!(await isOngoing(slug))) continue;
 
-      if (remainingSkip > 0) {
-        remainingSkip -= 1;
-        continue;
+        if (remainingSkip > 0) {
+          remainingSkip -= 1;
+          continue;
+        }
+
+        metas.push(item);
+        if (metas.length >= PAGE_SIZE) break;
       }
 
-      metas.push(item);
-      if (metas.length >= PAGE_SIZE) break;
+      page += 1;
     }
 
-    page += 1;
+    await enrichMetasWithCinemeta(metas);
+    for (const item of metas) delete item._slug;
+    return { metas };
+  } catch (err) {
+    stats.lastError = {
+      at: new Date().toISOString(),
+      where: "catalogOngoing",
+      message: err?.message || String(err)
+    };
+    return { metas: [] };
   }
-
-  await enrichMetasWithCinemeta(metas);
-  for (const item of metas) delete item._slug;
-  return { metas };
 }
 
 async function handleMeta(seriesId) {
@@ -539,52 +567,72 @@ async function handleMeta(seriesId) {
 
   if (!slug) return { meta: null };
 
-  const url = `${BASE_URL}/drama/${slug}/`;
-  const html = await fetchHtml(url);
-  const meta = parseDramaMeta(html, slug);
+  try {
+    const url = `${BASE_URL}/drama/${slug}/`;
+    const html = await fetchHtml(url);
+    const meta = parseDramaMeta(html, slug);
 
-  const cinemeta = imdbId
-    ? await fetchCinemetaByImdb(imdbId)
-    : await fetchCinemetaByTitle(meta.name);
+    const cinemeta = imdbId
+      ? await fetchCinemetaByImdb(imdbId)
+      : await fetchCinemetaByTitle(meta.name);
 
-  if (cinemeta) {
-    if (cinemeta.poster) meta.poster = cinemeta.poster;
-    if (cinemeta.background) meta.background = cinemeta.background;
-    if (cinemeta.imdb_id) meta.imdb_id = cinemeta.imdb_id;
+    if (cinemeta) {
+      if (cinemeta.poster) meta.poster = cinemeta.poster;
+      if (cinemeta.background) meta.background = cinemeta.background;
+      if (cinemeta.imdb_id) meta.imdb_id = cinemeta.imdb_id;
+    }
+
+    return { meta };
+  } catch (err) {
+    stats.lastError = {
+      at: new Date().toISOString(),
+      where: "meta",
+      message: err?.message || String(err),
+      id: seriesId
+    };
+    return { meta: null };
   }
-
-  return { meta };
 }
 
 async function handleStream(videoId) {
-  const match = videoId.match(/^voirdrama:([^:]+):([^:]+)$/);
-  if (!match) return { streams: [] };
+  try {
+    const match = videoId.match(/^voirdrama:([^:]+):([^:]+)$/);
+    if (!match) return { streams: [] };
 
-  const seriesSlug = match[1];
-  const episodeSlug = match[2];
-  const url = `${BASE_URL}/drama/${seriesSlug}/${episodeSlug}/`;
-  const html = await fetchHtml(url);
-  const sources = extractStreamSources(html);
+    const seriesSlug = match[1];
+    const episodeSlug = match[2];
+    const url = `${BASE_URL}/drama/${seriesSlug}/${episodeSlug}/`;
+    const html = await fetchHtml(url);
+    const sources = extractStreamSources(html);
 
-  const streams = [];
-  for (const s of sources) {
-    if (isVidmoly(s.url)) {
-      const direct = await resolveVidmoly(s.url);
-      if (direct) {
-        streams.push({
-          title: `${s.name} (direct)`,
-          url: direct
-        });
-        continue;
+    const streams = [];
+    for (const s of sources) {
+      if (isVidmoly(s.url)) {
+        const direct = await resolveVidmoly(s.url);
+        if (direct) {
+          streams.push({
+            title: `${s.name} (direct)`,
+            url: direct
+          });
+          continue;
+        }
       }
+      streams.push({
+        title: s.name,
+        externalUrl: s.url
+      });
     }
-    streams.push({
-      title: s.name,
-      externalUrl: s.url
-    });
-  }
 
-  return { streams };
+    return { streams };
+  } catch (err) {
+    stats.lastError = {
+      at: new Date().toISOString(),
+      where: "stream",
+      message: err?.message || String(err),
+      id: videoId
+    };
+    return { streams: [] };
+  }
 }
 
 const builder = new addonBuilder(manifest);

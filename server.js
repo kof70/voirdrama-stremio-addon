@@ -15,10 +15,10 @@ const getRouter = require("stremio-addon-sdk/src/getRouter");
 const landingTemplate = require("stremio-addon-sdk/src/landingTemplate");
 
 const manifest = {
-  id: "org.voirdrama.addon",
-  version: "0.1.1",
-  name: "VoirDrama",
-  description: "Addon VoirDrama (catalogue, metadata, stream)",
+  id: "org.kdrama.addon",
+  version: "2.0.0",
+  name: "KDrama",
+  description: "Addon KDrama (catalogue, metadata, stream)",
   logo: "https://voirdrama.org/wp-content/uploads/2022/07/voirdrama-logo.png",
   background: "https://voirdrama.org/wp-content/uploads/2022/07/voirdrama-logo.png",
   resources: ["catalog", "meta", "stream"],

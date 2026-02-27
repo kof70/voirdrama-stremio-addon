@@ -5,8 +5,16 @@ import path from "path";
 import crypto from "crypto";
 import { createRequire } from "module";
 
-const BASE_URL = "https://voirdrama.org";
+const BASE_URL = process.env.BASE_URL || "https://voirdrama.tv";
+const SITE_ORIGIN = (() => {
+  try {
+    return new URL(BASE_URL).origin;
+  } catch {
+    return BASE_URL;
+  }
+})();
 const PORT = Number(process.env.PORT || 7000);
+const HOST = process.env.HOST || "0.0.0.0";
 const CACHE_DIR = process.env.CACHE_DIR || "/tmp/voirdrama-stremio-cache";
 const { addonBuilder } = sdk;
 const require = createRequire(import.meta.url);
@@ -159,6 +167,10 @@ function decodeHtml(str) {
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
     .replace(/&#039;/g, "'")
+    .replace(/&#8217;/g, "'")
+    .replace(/&#8216;/g, "'")
+    .replace(/&#8220;/g, '"')
+    .replace(/&#8221;/g, '"')
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/\s+/g, " ")
@@ -183,14 +195,29 @@ function videoIdFromSlugs(seriesSlug, episodeSlug) {
   return `voirdrama:${seriesSlug}:${episodeSlug}`;
 }
 
+function toAbsoluteUrl(url) {
+  if (!url) return null;
+  try {
+    return new URL(url, SITE_ORIGIN).toString();
+  } catch {
+    return null;
+  }
+}
+
 function parseSlugFromDramaUrl(url) {
-  const match = url.match(/https?:\/\/voirdrama\.org\/drama\/([^/]+)\/?$/);
-  return match ? match[1] : null;
+  const absolute = toAbsoluteUrl(url);
+  if (!absolute) return null;
+  const path = new URL(absolute).pathname;
+  const match = path.match(/^\/drama\/([^/]+)\/?$/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 function parseEpisodeSlugFromUrl(url) {
-  const match = url.match(/https?:\/\/voirdrama\.org\/drama\/[^/]+\/([^/]+)\/?$/);
-  return match ? match[1] : null;
+  const absolute = toAbsoluteUrl(url);
+  if (!absolute) return null;
+  const path = new URL(absolute).pathname;
+  const match = path.match(/^\/drama\/[^/]+\/([^/]+)\/?$/);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
 const imdbToSlug = new Map();
@@ -198,11 +225,12 @@ const imdbToSlug = new Map();
 function parseCatalogItems(html) {
   const items = [];
   const seen = new Set();
-  const linkRegex = /<a href="(https:\/\/voirdrama\.org\/drama\/[^/\"]+\/)">([^<]+)<\/a>/g;
+  const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/g;
 
   let match;
   while ((match = linkRegex.exec(html))) {
-    const url = match[1];
+    const rawUrl = match[1];
+    const url = toAbsoluteUrl(rawUrl) || rawUrl;
     const title = decodeHtml(match[2]);
     const slug = parseSlugFromDramaUrl(url);
     if (!slug || seen.has(slug)) continue;
@@ -223,7 +251,14 @@ function parseCatalogItems(html) {
 }
 
 function extractPosterNearUrl(html, url) {
-  const idx = html.indexOf(url);
+  const absolute = toAbsoluteUrl(url);
+  const pathname = absolute ? new URL(absolute).pathname : null;
+  const candidates = [url, absolute, pathname].filter(Boolean);
+  let idx = -1;
+  for (const candidate of candidates) {
+    idx = html.indexOf(candidate);
+    if (idx !== -1) break;
+  }
   if (idx === -1) return null;
   const start = Math.max(0, idx - 800);
   const end = Math.min(html.length, idx + 800);
@@ -245,20 +280,33 @@ function extractPosterNearUrl(html, url) {
 }
 
 function parseDramaMeta(html, seriesSlug) {
-  const titleMatch = html.match(/<h1>\s*([^<]+)\s*<\/h1>/i);
-  const title = titleMatch ? decodeHtml(titleMatch[1]) : seriesSlug;
+  let title = seriesSlug;
+  const h1Match = html.match(/<h1[^>]*>\s*([^<]+)\s*<\/h1>/i);
+  if (h1Match) title = decodeHtml(h1Match[1]);
 
-  const posterMatch = html.match(/<div class="summary_image"[\s\S]*?<img[^>]+src="([^"]+)"/i);
-  const poster = posterMatch ? posterMatch[1] : null;
+  let poster = null;
+  const ogImageMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
+  if (ogImageMatch) poster = ogImageMatch[1];
+  if (!poster) {
+    const posterMatch = html.match(/<div class="summary_image"[\s\S]*?<img[^>]+src="([^"]+)"/i);
+    if (posterMatch) poster = posterMatch[1];
+  }
 
-  const descBlock = extractBetween(
-    html,
-    /<div class="summary__content\s*">/i,
-    /<\/div>/i
-  );
-  const description = descBlock
-    ? decodeHtml(descBlock.replace(/<[^>]+>/g, " "))
-    : null;
+  let description = null;
+  const ogDescMatch = html.match(/<meta property="og:description" content="([^"]+)"/i) || html.match(/<meta name="description" content="([^"]+)"/i);
+  if (ogDescMatch) {
+    description = decodeHtml(ogDescMatch[1]).trim();
+    if (description.length > 800) description = `${description.slice(0, 797)}...`;
+  } else {
+    const descBlock = extractBetween(
+      html,
+      /<div class="summary__content\s*">/i,
+      /<\/div>/i
+    );
+    description = descBlock
+      ? decodeHtml(descBlock.replace(/<[^>]+>/g, " "))
+      : null;
+  }
 
   const genres = [];
   const genreRegex = /rel="tag">([^<]+)<\/a>/g;
@@ -284,14 +332,16 @@ function parseDramaMeta(html, seriesSlug) {
 
 function parseEpisodes(html, seriesSlug) {
   const episodes = [];
+  const seriesPathPrefix = `/drama/${seriesSlug}/`;
   const liRegex = /<li class="wp-manga-chapter[\s\S]*?<\/li>/g;
   let m;
   while ((m = liRegex.exec(html))) {
     const block = m[0];
-    const linkMatch = block.match(/<a href="(https:\/\/voirdrama\.org\/drama\/[^/]+\/[^/\"]+\/)"[^>]*>([^<]+)<\/a>/i);
+    const linkMatch = block.match(/<a[^>]+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/i);
     if (!linkMatch) continue;
 
-    const episodeUrl = linkMatch[1];
+    const episodeUrl = toAbsoluteUrl(linkMatch[1]) || linkMatch[1];
+    if (!new URL(episodeUrl, SITE_ORIGIN).pathname.startsWith(seriesPathPrefix)) continue;
     const epText = decodeHtml(linkMatch[2]);
     const episodeSlug = parseEpisodeSlugFromUrl(episodeUrl);
     if (!episodeSlug) continue;
@@ -309,6 +359,27 @@ function parseEpisodes(html, seriesSlug) {
       episode: episode,
       released: released
     });
+  }
+
+  if (!episodes.length) {
+    const linkRegex2 = /<a[^>]+href=["']([^"']+)["'][^>]*>([^<]*)<\/a>/g;
+    let linkMatch;
+    while ((linkMatch = linkRegex2.exec(html))) {
+      const episodeUrl = toAbsoluteUrl(linkMatch[1]) || linkMatch[1];
+      if (!new URL(episodeUrl, SITE_ORIGIN).pathname.startsWith(seriesPathPrefix)) continue;
+      const epText = decodeHtml(linkMatch[2]);
+      const episodeSlug = parseEpisodeSlugFromUrl(episodeUrl);
+      if (!episodeSlug) continue;
+      const episodeNumMatch = epText.match(/(\d+)/);
+      const episode = episodeNumMatch ? Number(episodeNumMatch[1]) : undefined;
+      episodes.push({
+        id: videoIdFromSlugs(seriesSlug, episodeSlug),
+        title: `Episode ${episode ?? epText}`,
+        season: 1,
+        episode: episode,
+        released: undefined
+      });
+    }
   }
 
   return episodes;
@@ -485,54 +556,18 @@ async function handleCatalogPaged(search, skip, mode = "default") {
   }
 }
 
-async function isOngoing(slug) {
-  if (!slug) return false;
-  const url = `${BASE_URL}/drama/${slug}/`;
-  try {
-    const html = await fetchHtml(url);
-    const match = html.match(
-      /<h5>\s*Status\s*<\/h5>[\s\S]*?<div class="summary-content">\s*([^<]+)\s*</i
-    );
-    if (!match) return false;
-    const status = decodeHtml(match[1]).toLowerCase();
-    return status.includes("en cours") || status.includes("ongoing");
-  } catch {
-    return false;
-  }
-}
-
 async function handleCatalogOngoing(skip) {
   try {
-    const metas = [];
-    let remainingSkip = Math.max(0, skip || 0);
-    let page = 1;
-    const maxPages = 12;
-
-    while (metas.length < PAGE_SIZE && page <= maxPages) {
-      const basePath = page > 1 ? `${BASE_URL}/drama/page/${page}/` : `${BASE_URL}/drama/`;
-      const html = await fetchHtml(basePath);
-      const items = parseCatalogItems(html);
-
-      for (const item of items) {
-        const slug = item._slug;
-        if (!slug) continue;
-        if (!(await isOngoing(slug))) continue;
-
-        if (remainingSkip > 0) {
-          remainingSkip -= 1;
-          continue;
-        }
-
-        metas.push(item);
-        if (metas.length >= PAGE_SIZE) break;
-      }
-
-      page += 1;
-    }
-
-    await enrichMetasWithCinemeta(metas);
-    for (const item of metas) delete item._slug;
-    return { metas };
+    const page = Math.floor((skip || 0) / PAGE_SIZE) + 1;
+    const ongoingQuery = "status%5B%5D=on-going";
+    const url = page > 1
+      ? `${BASE_URL}/drama/page/${page}/?${ongoingQuery}`
+      : `${BASE_URL}/drama/?${ongoingQuery}`;
+    const html = await fetchHtml(url);
+    const items = parseCatalogItems(html);
+    await enrichMetasWithCinemeta(items);
+    for (const item of items) delete item._slug;
+    return { metas: items };
   } catch (err) {
     stats.lastError = {
       at: new Date().toISOString(),
@@ -620,6 +655,14 @@ async function handleStream(videoId) {
       streams.push({
         title: s.name,
         externalUrl: s.url
+      });
+    }
+
+    if (!streams.length) {
+      console.warn(`[stream] no sources found for ${videoId}, using episode page`);
+      streams.push({
+        title: "VoirDrama (page épisode)",
+        externalUrl: url
       });
     }
 
@@ -711,5 +754,10 @@ if (hasConfig) {
   });
 }
 
-http.createServer(app).listen(PORT, "0.0.0.0");
-console.log(`VoirDrama addon running at http://0.0.0.0:${PORT}/manifest.json`);
+const server = http.createServer(app);
+server.on("error", (err) => {
+  console.error(`[startup] failed to listen on ${HOST}:${PORT}`, err);
+});
+server.listen(PORT, HOST, () => {
+  console.log(`VoirDrama addon running at http://${HOST}:${PORT}/manifest.json`);
+});
